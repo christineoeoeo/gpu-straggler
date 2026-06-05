@@ -1,0 +1,78 @@
+import subprocess
+
+username = "kgzh0394"
+
+workers = {
+    "PC1": "localhost",
+    "PC2": "129.11.146.13",
+    "PC3": "129.11.145.76",
+    "PC4": "129.11.146.175",
+}
+
+remote_script = "~/gpu_straggler_project/cpu_loader_benchmark.py"
+
+base_cmd = (
+    "module load pytorch/2.5.1 && "
+    f"python {remote_script}"
+)
+
+# Make PC3 artificially slow using 2 CPU cores
+pc3_cmd = (
+    "module load pytorch/2.5.1 && "
+    f"taskset -c 0-1 python {remote_script}"
+)
+
+times = {}
+
+for pc, host in workers.items():
+    print(f"\nRunning benchmark on {pc}...")
+
+    if pc == "PC3":
+        cmd_to_run = pc3_cmd
+    else:
+        cmd_to_run = base_cmd
+
+    if host == "localhost":
+        final_cmd = cmd_to_run
+    else:
+        final_cmd = f"ssh {username}@{host} '{cmd_to_run}'"
+
+    result = subprocess.run(
+        final_cmd,
+        shell=True,
+        capture_output=True,
+        text=True
+    )
+
+    print(result.stdout)
+    if result.stderr:
+        print("ERROR:", result.stderr)
+
+    for line in result.stdout.splitlines():
+        if "Time:" in line:
+            times[pc] = float(line.split(":")[1].strip())
+
+print("\nCollected times:")
+for pc, t in times.items():
+    print(f"{pc}: {t:.2f}s")
+
+avg = sum(times.values()) / len(times)
+threshold = avg * 1.5
+
+print(f"\nAverage time: {avg:.2f}s")
+print(f"Straggler threshold: {threshold:.2f}s")
+
+print("\nDetection:")
+for pc, t in times.items():
+    if t > threshold:
+        print(f"{pc}: STRAGGLER")
+    else:
+        print(f"{pc}: normal")
+
+speeds = {pc: 1 / t for pc, t in times.items()}
+total_speed = sum(speeds.values())
+
+print("\nSuggested workload allocation:")
+for pc, speed in speeds.items():
+    share = speed / total_speed * 100
+    print(f"{pc}: {share:.2f}%")
