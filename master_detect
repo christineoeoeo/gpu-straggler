@@ -34,15 +34,6 @@ def build_training_command(pc_name):
 def run_worker(pc_name, host):
     training_command = build_training_command(pc_name)
 
-    if host == "localhost":
-        final_command = training_command
-    else:
-        final_command = [
-            "ssh",
-            f"{USERNAME}@{host}",
-            training_command,
-        ]
-
     print(f"\n{'=' * 60}")
     print(f"Running training on {pc_name}")
     print(f"Host: {host}")
@@ -58,8 +49,14 @@ def run_worker(pc_name, host):
                 check=False,
             )
         else:
+            ssh_command = [
+                "ssh",
+                f"{USERNAME}@{host}",
+                training_command,
+            ]
+
             result = subprocess.run(
-                final_command,
+                ssh_command,
                 capture_output=True,
                 text=True,
                 check=False,
@@ -72,7 +69,10 @@ def run_worker(pc_name, host):
     print(result.stdout)
 
     if result.returncode != 0:
-        print(f"ERROR: {pc_name} exited with code {result.returncode}")
+        print(
+            f"ERROR: {pc_name} exited with code "
+            f"{result.returncode}"
+        )
 
         if result.stderr:
             print(result.stderr)
@@ -85,15 +85,24 @@ def run_worker(pc_name, host):
 
     for line in result.stdout.splitlines():
         if line.startswith("FINAL_METRICS "):
-            metrics_text = line.removeprefix("FINAL_METRICS ")
+            metrics_text = line.removeprefix(
+                "FINAL_METRICS "
+            )
 
             try:
                 return json.loads(metrics_text)
+
             except json.JSONDecodeError as error:
-                print(f"Could not parse metrics from {pc_name}: {error}")
+                print(
+                    f"Could not parse metrics from "
+                    f"{pc_name}: {error}"
+                )
                 return None
 
-    print(f"No FINAL_METRICS line was found for {pc_name}.")
+    print(
+        f"No FINAL_METRICS line was found for {pc_name}."
+    )
+
     return None
 
 
@@ -128,10 +137,10 @@ def detect_stragglers(results):
         for pc_name, metrics in results.items()
     }
 
-    average_time = sum(epoch_times.values()) / len(epoch_times)
+    average_time = (
+        sum(epoch_times.values()) / len(epoch_times)
+    )
 
-    # A worker is marked as a straggler when its execution time
-    # is more than 1.5 times the average execution time.
     threshold = average_time * 1.5
 
     print("\nSTRAGGLER DETECTION")
@@ -150,13 +159,17 @@ def detect_stragglers(results):
         )
 
 
-def print_suggested_allocation(results):
-    # Because every worker processes the same number of samples,
-    # speed can be estimated using 1 / epoch_time.
+def calculate_speeds(results):
     speeds = {
         pc_name: 1.0 / metrics["epoch_time"]
         for pc_name, metrics in results.items()
     }
+
+    return speeds
+
+
+def print_suggested_allocation(results):
+    speeds = calculate_speeds(results)
 
     total_speed = sum(speeds.values())
 
@@ -171,17 +184,83 @@ def print_suggested_allocation(results):
         )
 
 
+def calculate_sample_allocation(
+    results,
+    total_samples=500,
+):
+    speeds = calculate_speeds(results)
+
+    total_speed = sum(speeds.values())
+
+    raw_allocations = {
+        pc_name: (
+            speeds[pc_name]
+            / total_speed
+            * total_samples
+        )
+        for pc_name in speeds
+    }
+
+    allocations = {
+        pc_name: int(raw_allocations[pc_name])
+        for pc_name in raw_allocations
+    }
+
+    allocated_so_far = sum(allocations.values())
+
+    remaining_samples = (
+        total_samples - allocated_so_far
+    )
+
+    decimal_order = sorted(
+        raw_allocations,
+        key=lambda pc_name: (
+            raw_allocations[pc_name]
+            - allocations[pc_name]
+        ),
+        reverse=True,
+    )
+
+    for pc_name in decimal_order[:remaining_samples]:
+        allocations[pc_name] += 1
+
+    print("\nSUGGESTED SAMPLE ALLOCATION")
+    print("-" * 40)
+
+    for pc_name, sample_count in allocations.items():
+        percentage = (
+            sample_count / total_samples * 100
+        )
+
+        print(
+            f"{pc_name}: "
+            f"{sample_count} images "
+            f"({percentage:.2f}%)"
+        )
+
+    print(
+        f"Total: {sum(allocations.values())} images"
+    )
+
+    return allocations
+
+
 def main():
     results = {}
 
     for pc_name, host in WORKERS.items():
-        metrics = run_worker(pc_name, host)
+        metrics = run_worker(
+            pc_name,
+            host,
+        )
 
         if metrics is not None:
             results[pc_name] = metrics
 
     if not results:
-        print("\nNo valid worker results were collected.")
+        print(
+            "\nNo valid worker results were collected."
+        )
         return
 
     print_summary(results)
@@ -189,12 +268,19 @@ def main():
     if len(results) != len(WORKERS):
         print(
             f"\nWarning: received results from "
-            f"{len(results)} of {len(WORKERS)} workers."
+            f"{len(results)} of "
+            f"{len(WORKERS)} workers."
         )
 
     if len(results) >= 2:
         detect_stragglers(results)
+
         print_suggested_allocation(results)
+
+        calculate_sample_allocation(
+            results,
+            total_samples=SUBSET_SIZE,
+        )
 
 
 if __name__ == "__main__":
