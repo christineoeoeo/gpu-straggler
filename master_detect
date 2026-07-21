@@ -1,78 +1,201 @@
+import json
 import subprocess
 
-username = "kgzh0394"
 
-workers = {
+USERNAME = "kgzh0394"
+
+WORKERS = {
     "PC1": "localhost",
-    "PC2": "129.11.146.13",
-    "PC3": "129.11.145.76",
-    "PC4": "129.11.146.175",
+    "PC2": "uol-nsd000041.leeds.ac.uk",
+    "PC3": "uol-bcpqk000684.leeds.ac.uk",
+    "PC4": "uol-pc-055690.leeds.ac.uk",
 }
 
-remote_script = "~/gpu_straggler_project/cpu_loader_benchmark.py"
+PYTHON_PATH = "/tmp/kgzh0394/pytorch-cu128/bin/python"
+TRAIN_SCRIPT = "/tmp/kgzh0394/gpu_straggler_project/train.py"
 
-base_cmd = (
-    "module load pytorch/2.5.1 && "
-    f"python {remote_script}"
-)
+SUBSET_SIZE = 500
+EPOCHS = 1
+BATCH_SIZE = 64
+NUM_WORKERS = 4
 
-# Make PC3 artificially slow using 2 CPU cores
-pc3_cmd = (
-    "module load pytorch/2.5.1 && "
-    f"taskset -c 0-1 python {remote_script}"
-)
 
-times = {}
-
-for pc, host in workers.items():
-    print(f"\nRunning benchmark on {pc}...")
-
-    if pc == "PC3":
-        cmd_to_run = pc3_cmd
-    else:
-        cmd_to_run = base_cmd
-
-    if host == "localhost":
-        final_cmd = cmd_to_run
-    else:
-        final_cmd = f"ssh {username}@{host} '{cmd_to_run}'"
-
-    result = subprocess.run(
-        final_cmd,
-        shell=True,
-        capture_output=True,
-        text=True
+def build_training_command(pc_name):
+    return (
+        f"{PYTHON_PATH} {TRAIN_SCRIPT} "
+        f"--worker-id {pc_name} "
+        f"--subset-size {SUBSET_SIZE} "
+        f"--epochs {EPOCHS} "
+        f"--batch-size {BATCH_SIZE} "
+        f"--num-workers {NUM_WORKERS}"
     )
 
+
+def run_worker(pc_name, host):
+    training_command = build_training_command(pc_name)
+
+    if host == "localhost":
+        final_command = training_command
+    else:
+        final_command = [
+            "ssh",
+            f"{USERNAME}@{host}",
+            training_command,
+        ]
+
+    print(f"\n{'=' * 60}")
+    print(f"Running training on {pc_name}")
+    print(f"Host: {host}")
+    print(f"{'=' * 60}")
+
+    try:
+        if host == "localhost":
+            result = subprocess.run(
+                training_command,
+                shell=True,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        else:
+            result = subprocess.run(
+                final_command,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+    except Exception as error:
+        print(f"{pc_name} could not be started: {error}")
+        return None
+
     print(result.stdout)
+
+    if result.returncode != 0:
+        print(f"ERROR: {pc_name} exited with code {result.returncode}")
+
+        if result.stderr:
+            print(result.stderr)
+
+        return None
+
     if result.stderr:
-        print("ERROR:", result.stderr)
+        print("Warnings:")
+        print(result.stderr)
 
     for line in result.stdout.splitlines():
-        if "Time:" in line:
-            times[pc] = float(line.split(":")[1].strip())
+        if line.startswith("FINAL_METRICS "):
+            metrics_text = line.removeprefix("FINAL_METRICS ")
 
-print("\nCollected times:")
-for pc, t in times.items():
-    print(f"{pc}: {t:.2f}s")
+            try:
+                return json.loads(metrics_text)
+            except json.JSONDecodeError as error:
+                print(f"Could not parse metrics from {pc_name}: {error}")
+                return None
 
-avg = sum(times.values()) / len(times)
-threshold = avg * 1.5
+    print(f"No FINAL_METRICS line was found for {pc_name}.")
+    return None
 
-print(f"\nAverage time: {avg:.2f}s")
-print(f"Straggler threshold: {threshold:.2f}s")
 
-print("\nDetection:")
-for pc, t in times.items():
-    if t > threshold:
-        print(f"{pc}: STRAGGLER")
-    else:
-        print(f"{pc}: normal")
+def print_summary(results):
+    print(f"\n{'=' * 75}")
+    print("PROFILING SUMMARY")
+    print(f"{'=' * 75}")
 
-speeds = {pc: 1 / t for pc, t in times.items()}
-total_speed = sum(speeds.values())
+    print(
+        f"{'PC':<6}"
+        f"{'GPU':<30}"
+        f"{'Samples':<10}"
+        f"{'Time (s)':<12}"
+        f"{'Throughput':<12}"
+    )
 
-print("\nSuggested workload allocation:")
-for pc, speed in speeds.items():
-    share = speed / total_speed * 100
-    print(f"{pc}: {share:.2f}%")
+    print("-" * 75)
+
+    for pc_name, metrics in results.items():
+        print(
+            f"{pc_name:<6}"
+            f"{metrics['gpu']:<30}"
+            f"{metrics['samples']:<10}"
+            f"{metrics['epoch_time']:<12.4f}"
+            f"{metrics['throughput']:<12.2f}"
+        )
+
+
+def detect_stragglers(results):
+    epoch_times = {
+        pc_name: metrics["epoch_time"]
+        for pc_name, metrics in results.items()
+    }
+
+    average_time = sum(epoch_times.values()) / len(epoch_times)
+
+    # A worker is marked as a straggler when its execution time
+    # is more than 1.5 times the average execution time.
+    threshold = average_time * 1.5
+
+    print("\nSTRAGGLER DETECTION")
+    print("-" * 40)
+    print(f"Average epoch time: {average_time:.4f}s")
+    print(f"Threshold:          {threshold:.4f}s")
+
+    for pc_name, epoch_time in epoch_times.items():
+        if epoch_time > threshold:
+            status = "STRAGGLER"
+        else:
+            status = "normal"
+
+        print(
+            f"{pc_name}: {epoch_time:.4f}s — {status}"
+        )
+
+
+def print_suggested_allocation(results):
+    # Because every worker processes the same number of samples,
+    # speed can be estimated using 1 / epoch_time.
+    speeds = {
+        pc_name: 1.0 / metrics["epoch_time"]
+        for pc_name, metrics in results.items()
+    }
+
+    total_speed = sum(speeds.values())
+
+    print("\nINITIAL SUGGESTED WORKLOAD SHARES")
+    print("-" * 40)
+
+    for pc_name, speed in speeds.items():
+        percentage = speed / total_speed * 100
+
+        print(
+            f"{pc_name}: {percentage:.2f}%"
+        )
+
+
+def main():
+    results = {}
+
+    for pc_name, host in WORKERS.items():
+        metrics = run_worker(pc_name, host)
+
+        if metrics is not None:
+            results[pc_name] = metrics
+
+    if not results:
+        print("\nNo valid worker results were collected.")
+        return
+
+    print_summary(results)
+
+    if len(results) != len(WORKERS):
+        print(
+            f"\nWarning: received results from "
+            f"{len(results)} of {len(WORKERS)} workers."
+        )
+
+    if len(results) >= 2:
+        detect_stragglers(results)
+        print_suggested_allocation(results)
+
+
+if __name__ == "__main__":
+    main()
