@@ -328,7 +328,7 @@ def detect_stragglers(results):
     return detected_stragglers
 
 
-def calculate_batch_allocation()(
+def calculate_batch_allocation(
     results,
     total_samples,
 ):
