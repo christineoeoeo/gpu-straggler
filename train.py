@@ -30,8 +30,18 @@ def parse_arguments():
     parser.add_argument(
         "--subset-size",
         type=int,
-        default=500,
-        help="Number of CIFAR-10 images used for Stage 1",
+        default=12500,
+        help="Size of the worker's fixed local dataset",
+    )
+
+    parser.add_argument(
+        "--max-batches",
+        type=int,
+        default=None,
+        help=(
+            "Maximum number of local mini-batches processed during "
+            "the complete training run. By default, all batches are processed."
+        ),
     )
 
     parser.add_argument(
@@ -119,6 +129,9 @@ def main():
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA GPU was not detected")
 
+    if args.max_batches is not None and args.max_batches <= 0:
+        raise ValueError("--max-batches must be greater than zero")
+
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
 
@@ -154,22 +167,36 @@ def main():
     print(f"Worker: {args.worker_id}")
     print(f"Hostname: {hostname}")
     print(f"GPU: {torch.cuda.get_device_name(0)}")
-    print(f"Stage 1 samples: {len(loader.dataset)}")
+    print(f"Local dataset size: {len(loader.dataset)}")
+    print(f"Maximum batches: {args.max_batches}")
     print(f"Batch size: {args.batch_size}")
     print(f"CPU DataLoader workers: {args.num_workers}")
     print(f"Artificial delay: {args.delay}s")
 
     total_correct = 0
     total_samples_processed = 0
+    total_batches_processed = 0
+
     iteration_times = []
     epoch_times = []
 
     model.train()
 
+    stop_training = False
+
     for epoch in range(args.epochs):
         epoch_start = time.perf_counter()
+        epoch_batches_processed = 0
 
         for batch_index, (images, labels) in enumerate(loader):
+            # Stop when this worker reaches its assigned work budget.
+            if (
+                args.max_batches is not None
+                and total_batches_processed >= args.max_batches
+            ):
+                stop_training = True
+                break
+
             iteration_start = time.perf_counter()
 
             images = images.to(
@@ -200,6 +227,7 @@ def main():
             )
 
             batch_samples = labels.size(0)
+
             batch_throughput = (
                 batch_samples / iteration_time
                 if iteration_time > 0
@@ -215,15 +243,16 @@ def main():
             ).sum().item()
 
             total_samples_processed += batch_samples
+            total_batches_processed += 1
+            epoch_batches_processed += 1
 
-            # With 500 images and batch size 64, there are
-            # approximately eight batches. Print every batch.
             progress_metrics = {
                 "type": "progress",
                 "worker_id": args.worker_id,
                 "hostname": hostname,
                 "epoch": epoch + 1,
                 "batch": batch_index,
+                "total_batches_processed": total_batches_processed,
                 "iteration_time": round(
                     iteration_time,
                     6,
@@ -250,12 +279,18 @@ def main():
             time.perf_counter() - epoch_start
         )
 
-        epoch_times.append(epoch_time)
+        # Only count epochs in which work was processed.
+        if epoch_batches_processed > 0:
+            epoch_times.append(epoch_time)
 
         print(
             f"Epoch {epoch + 1}/{args.epochs}: "
-            f"{epoch_time:.2f}s"
+            f"{epoch_time:.2f}s, "
+            f"{epoch_batches_processed} batches processed"
         )
+
+        if stop_training:
+            break
 
     total_training_time = sum(epoch_times)
 
@@ -282,8 +317,11 @@ def main():
         "worker_id": args.worker_id,
         "hostname": hostname,
         "gpu": torch.cuda.get_device_name(0),
-        "epochs": args.epochs,
-        "samples": len(loader.dataset),
+        "epochs_requested": args.epochs,
+        "local_dataset_size": len(loader.dataset),
+        "max_batches": args.max_batches,
+        "batches_processed": total_batches_processed,
+        "samples_processed": total_samples_processed,
         "epoch_time": round(
             total_training_time,
             6,
