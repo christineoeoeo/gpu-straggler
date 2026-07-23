@@ -1,0 +1,320 @@
+import concurrent.futures
+import json
+import statistics
+import subprocess
+
+
+USERNAME = "kgzh0394"
+
+workers = {
+    "PC1": "localhost",
+    "PC2": "129.11.144.79",
+    "PC3": "129.11.144.252",
+    "PC4": "129.11.146.207",
+}
+
+project_dir = "/tmp/kgzh0394/gpu_straggler_project"
+python_path = "/tmp/kgzh0394/pytorch-cu128/bin/python"
+
+TOTAL_IMAGES = 2000
+
+allocation = {
+    "PC1": 524,
+    "PC2": 382,
+    "PC3": 597,
+    "PC4": 497,
+}
+
+
+def run_worker(
+    worker_id: str,
+    host: str,
+    subset_size: int,
+) -> dict:
+    command = (
+        f"cd {project_dir} && "
+        f"{python_path} train.py "
+        f"--worker-id {worker_id} "
+        f"--subset-size {subset_size}"
+    )
+
+    # Create PC2 as the controlled CPU straggler.
+    if worker_id == "PC2":
+        command = (
+            f"cd {project_dir} && "
+            f"taskset -c 0 {python_path} train.py "
+            f"--worker-id {worker_id} "
+            f"--subset-size {subset_size}"
+        )
+
+    if host == "localhost":
+        final_command = [
+            "bash",
+            "-lc",
+            command,
+        ]
+    else:
+        final_command = [
+            "ssh",
+            f"{USERNAME}@{host}",
+            command,
+        ]
+
+    print(
+        f"Starting {worker_id} "
+        f"with {subset_size} images..."
+    )
+
+    result = subprocess.run(
+        final_command,
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"{worker_id} failed:\n"
+            f"{result.stderr}"
+        )
+
+    for line in result.stdout.splitlines():
+        if line.startswith("FINAL_METRICS "):
+            metrics_json = line.removeprefix(
+                "FINAL_METRICS "
+            )
+
+            metrics = json.loads(metrics_json)
+            metrics["allocated_images"] = subset_size
+
+            return metrics
+
+    raise RuntimeError(
+        f"No FINAL_METRICS received from "
+        f"{worker_id}.\n"
+        f"Output:\n{result.stdout}"
+    )
+
+
+def detect_stragglers(results: list[dict]) -> None:
+    throughputs = [
+        result["throughput"]
+        for result in results
+    ]
+
+    median_throughput = statistics.median(
+        throughputs
+    )
+
+    threshold = median_throughput * 0.85   # from 0.8 as trying on 2000 img only
+    epoch_times = [
+        result["epoch_time"]
+        for result in results
+    ]
+
+    round_completion_time = max(epoch_times)
+
+    print("\nCollected results:")
+
+    for result in sorted(
+        results,
+        key=lambda item: item["worker_id"],
+    ):
+        print(
+            f"{result['worker_id']}: "
+            f"images={result['allocated_images']}, "
+            f"epoch={result['epoch_time']:.3f}s, "
+            f"iteration={result['average_iteration_time']:.6f}s, "
+            f"throughput={result['throughput']:.2f}, "
+            f"accuracy={result['training_accuracy']:.2f}%"
+        )
+
+    print(
+        f"\nMedian throughput: "
+        f"{median_throughput:.2f} images/s"
+    )
+
+    print(
+        f"Threshold: "
+        f"{threshold:.2f} images/s"
+    )
+
+    print(
+        f"Round completion time: "
+        f"{round_completion_time:.3f}s"
+    )
+
+    print("\nDetection:")
+
+    for result in sorted(
+        results,
+        key=lambda item: item["worker_id"],
+    ):
+        status = (
+            "STRAGGLER"
+            if result["throughput"] < threshold
+            else "NORMAL"
+        )
+
+        print(
+            f"{result['worker_id']}: {status}"
+        )
+
+def calculate_adaptive_allocation(
+    results: list[dict],
+    total_images: int,
+) -> dict:
+    speeds = {
+        result["worker_id"]: result["throughput"]
+        for result in results
+    }
+
+    total_speed = sum(
+        speeds.values()
+    )
+
+    raw_allocations = {
+        worker_id: (
+            speed
+            / total_speed
+            * total_images
+        )
+        for worker_id, speed in speeds.items()
+    }
+
+    adaptive_allocation = {
+        worker_id: int(value)
+        for worker_id, value
+        in raw_allocations.items()
+    }
+
+    remaining_images = (
+        total_images
+        - sum(adaptive_allocation.values())
+    )
+
+    remainder_order = sorted(
+        raw_allocations,
+        key=lambda worker_id: (
+            raw_allocations[worker_id]
+            - adaptive_allocation[worker_id]
+        ),
+        reverse=True,
+    )
+
+    for worker_id in remainder_order[
+        :remaining_images
+    ]:
+        adaptive_allocation[worker_id] += 1
+
+    print("\nADAPTIVE ALLOCATION")
+    print("-" * 40)
+
+    for worker_id in sorted(
+        adaptive_allocation
+    ):
+        image_count = adaptive_allocation[
+            worker_id
+        ]
+
+        percentage = (
+            image_count
+            / total_images
+            * 100
+        )
+
+        print(
+            f"{worker_id}: "
+            f"{image_count} images "
+            f"({percentage:.2f}%)"
+        )
+
+    print(
+        f"Total: "
+        f"{sum(adaptive_allocation.values())} images"
+    )
+
+    return adaptive_allocation
+
+
+def main() -> None:
+    if sum(allocation.values()) != TOTAL_IMAGES:
+        raise ValueError(
+            f"Allocation must total "
+            f"{TOTAL_IMAGES} images."
+        )
+
+    results = []
+
+    print("=" * 60)
+    print("PHASE 2: CONTROLLED STRAGGLER EXPERIMENT")
+    print("=" * 60)
+
+    print("\nWorkload allocation:")
+
+    for worker_id, subset_size in allocation.items():
+        suffix = (
+            " (CPU restricted)"
+            if worker_id == "PC2"
+            else ""
+        )
+
+        print(
+            f"{worker_id}: "
+            f"{subset_size} images"
+            f"{suffix}"
+        )
+
+    print(
+        f"Total: "
+        f"{sum(allocation.values())} images"
+    )
+
+    # Launch all workers at approximately the same time.
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=4
+    ) as executor:
+        futures = {
+            executor.submit(
+                run_worker,
+                worker_id,
+                host,
+                allocation[worker_id],
+            ): worker_id
+            for worker_id, host in workers.items()
+        }
+
+        for future in concurrent.futures.as_completed(
+            futures
+        ):
+            worker_id = futures[future]
+
+            try:
+                result = future.result()
+                results.append(result)
+
+                print(
+                    f"Completed {worker_id}"
+                )
+
+            except Exception as error:
+                print(
+                    f"ERROR: {error}"
+                )
+
+    if len(results) != len(workers):
+        raise RuntimeError(
+            f"Only received {len(results)} of "
+            f"{len(workers)} worker results."
+        )
+
+    detect_stragglers(results)
+
+    calculate_adaptive_allocation(
+        results,
+        total_images=TOTAL_IMAGES,
+    )
+
+
+if __name__ == "__main__":
+    main()
