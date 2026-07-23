@@ -1,4 +1,5 @@
 import json
+import statistics
 import subprocess
 
 
@@ -14,30 +15,48 @@ WORKERS = {
 PYTHON_PATH = "/tmp/kgzh0394/pytorch-cu128/bin/python"
 TRAIN_SCRIPT = "/tmp/kgzh0394/gpu_straggler_project/train.py"
 
-SUBSET_SIZE = 500
+TOTAL_BATCHES = 400
+
+INITIAL_ALLOCATION = {
+    "PC1": 100,
+    "PC2": 100,
+    "PC3": 100,
+    "PC4": 100,
+}
+
 EPOCHS = 1
 BATCH_SIZE = 64
 NUM_WORKERS = 4
 
+# Each worker runs five times.
+# The first successful run is ignored as warm-up.
+PROFILING_RUNS = 5
 
-def build_training_command(pc_name):
+
+def build_training_command(
+    pc_name,
+    max_batches,
+):
     return (
         f"{PYTHON_PATH} {TRAIN_SCRIPT} "
         f"--worker-id {pc_name} "
-        f"--subset-size {SUBSET_SIZE} "
+        f"--subset-size 12500 "
+        f"--max-batches {max_batches} "
         f"--epochs {EPOCHS} "
         f"--batch-size {BATCH_SIZE} "
         f"--num-workers {NUM_WORKERS}"
     )
 
 
-def run_worker(pc_name, host):
-    training_command = build_training_command(pc_name)
-
-    print(f"\n{'=' * 60}")
-    print(f"Running training on {pc_name}")
-    print(f"Host: {host}")
-    print(f"{'=' * 60}")
+def run_worker_once(
+    pc_name,
+    host,
+    subset_size,
+):
+    training_command = build_training_command(
+        pc_name,
+        subset_size,
+    )
 
     try:
         if host == "localhost":
@@ -48,6 +67,7 @@ def run_worker(pc_name, host):
                 text=True,
                 check=False,
             )
+
         else:
             ssh_command = [
                 "ssh",
@@ -63,10 +83,10 @@ def run_worker(pc_name, host):
             )
 
     except Exception as error:
-        print(f"{pc_name} could not be started: {error}")
+        print(
+            f"{pc_name} could not start: {error}"
+        )
         return None
-
-    print(result.stdout)
 
     if result.returncode != 0:
         print(
@@ -74,14 +94,13 @@ def run_worker(pc_name, host):
             f"{result.returncode}"
         )
 
+        if result.stdout:
+            print(result.stdout)
+
         if result.stderr:
             print(result.stderr)
 
         return None
-
-    if result.stderr:
-        print("Warnings:")
-        print(result.stderr)
 
     for line in result.stdout.splitlines():
         if line.startswith("FINAL_METRICS "):
@@ -100,35 +119,141 @@ def run_worker(pc_name, host):
                 return None
 
     print(
-        f"No FINAL_METRICS line was found for {pc_name}."
+        f"No FINAL_METRICS line found for {pc_name}."
     )
+
+    if result.stdout:
+        print(result.stdout)
+
+    if result.stderr:
+        print(result.stderr)
 
     return None
 
 
+def profile_worker(
+    pc_name,
+    host,
+    subset_size,
+):
+    successful_runs = []
+
+    print(f"\n{'=' * 60}")
+    print(f"Profiling {pc_name}")
+    print(f"Host: {host}")
+    print(f"Allocated samples: {subset_size}")
+    print(f"{'=' * 60}")
+
+    for run_number in range(
+        1,
+        PROFILING_RUNS + 1,
+    ):
+        print(
+            f"{pc_name} run "
+            f"{run_number}/{PROFILING_RUNS}..."
+        )
+
+        metrics = run_worker_once(
+            pc_name,
+            host,
+            subset_size,
+        )
+
+        if metrics is None:
+            print(
+                f"{pc_name} run "
+                f"{run_number} failed."
+            )
+            continue
+
+        successful_runs.append(metrics)
+
+        print(
+            f"Time: {metrics['epoch_time']:.4f}s, "
+            f"throughput: "
+            f"{metrics['throughput']:.2f}"
+        )
+
+    if len(successful_runs) < 2:
+        print(
+            f"Not enough successful runs for "
+            f"{pc_name}."
+        )
+        return None
+
+    # Ignore the first successful run as warm-up.
+    measured_runs = successful_runs[1:]
+
+    epoch_times = [
+        metrics["epoch_time"]
+        for metrics in measured_runs
+    ]
+
+    throughputs = [
+        metrics["throughput"]
+        for metrics in measured_runs
+    ]
+
+    median_time = statistics.median(
+        epoch_times
+    )
+
+    median_throughput = statistics.median(
+        throughputs
+    )
+
+    final_result = successful_runs[-1].copy()
+
+    final_result["samples"] = subset_size
+    final_result["epoch_time"] = median_time
+    final_result["throughput"] = median_throughput
+    final_result["profiling_times"] = epoch_times
+    final_result["successful_runs"] = len(
+        successful_runs
+    )
+
+    print(
+        f"{pc_name} median time: "
+        f"{median_time:.4f}s"
+    )
+
+    return final_result
+
+
 def print_summary(results):
-    print(f"\n{'=' * 75}")
-    print("PROFILING SUMMARY")
-    print(f"{'=' * 75}")
+    print(f"\n{'=' * 82}")
+    print("EQUAL-ALLOCATION PROFILING SUMMARY")
+    print(f"{'=' * 82}")
 
     print(
         f"{'PC':<6}"
         f"{'GPU':<30}"
         f"{'Samples':<10}"
-        f"{'Time (s)':<12}"
+        f"{'Median (s)':<14}"
         f"{'Throughput':<12}"
     )
 
-    print("-" * 75)
+    print("-" * 82)
 
     for pc_name, metrics in results.items():
         print(
             f"{pc_name:<6}"
             f"{metrics['gpu']:<30}"
             f"{metrics['samples']:<10}"
-            f"{metrics['epoch_time']:<12.4f}"
+            f"{metrics['epoch_time']:<14.4f}"
             f"{metrics['throughput']:<12.2f}"
         )
+
+    total_samples = sum(
+        metrics["samples"]
+        for metrics in results.values()
+    )
+
+    print("-" * 82)
+    print(
+        f"Total samples across cluster: "
+        f"{total_samples}"
+    )
 
 
 def detect_stragglers(results):
@@ -137,81 +262,110 @@ def detect_stragglers(results):
         for pc_name, metrics in results.items()
     }
 
-    average_time = (
-        sum(epoch_times.values()) / len(epoch_times)
+    cluster_median = statistics.median(
+        epoch_times.values()
     )
 
-    threshold = average_time * 1.5
+    # Worker is a straggler if it is more than
+    # 20% slower than the cluster median.
+    threshold = cluster_median * 1.20
+
+    slowest_pc = max(
+        epoch_times,
+        key=epoch_times.get,
+    )
+
+    fastest_pc = min(
+        epoch_times,
+        key=epoch_times.get,
+    )
+
+    round_completion_time = max(
+        epoch_times.values()
+    )
 
     print("\nSTRAGGLER DETECTION")
-    print("-" * 40)
-    print(f"Average epoch time: {average_time:.4f}s")
-    print(f"Threshold:          {threshold:.4f}s")
+    print("-" * 48)
+    print(
+        f"Cluster median time:   "
+        f"{cluster_median:.4f}s"
+    )
+    print(
+        f"Straggler threshold:   "
+        f"{threshold:.4f}s"
+    )
+    print(
+        f"Round completion time: "
+        f"{round_completion_time:.4f}s"
+    )
+    print(
+        f"Fastest worker:        "
+        f"{fastest_pc}"
+    )
+    print(
+        f"Slowest worker:        "
+        f"{slowest_pc}"
+    )
+
+    detected_stragglers = []
 
     for pc_name, epoch_time in epoch_times.items():
         if epoch_time > threshold:
             status = "STRAGGLER"
+            detected_stragglers.append(pc_name)
+
+        elif pc_name == slowest_pc:
+            status = "slowest, but within threshold"
+
         else:
             status = "normal"
 
         print(
-            f"{pc_name}: {epoch_time:.4f}s — {status}"
+            f"{pc_name}: "
+            f"{epoch_time:.4f}s — {status}"
         )
 
+    return detected_stragglers
 
-def calculate_speeds(results):
+
+def calculate_batch_allocation()(
+    results,
+    total_samples,
+):
+    # Estimated processing speed in samples/second.
+    # Using samples divided by measured time is important
+    # because later workers may receive different workloads.
     speeds = {
-        pc_name: 1.0 / metrics["epoch_time"]
+        pc_name: (
+            metrics["samples"]
+            / metrics["epoch_time"]
+        )
         for pc_name, metrics in results.items()
     }
-
-    return speeds
-
-
-def print_suggested_allocation(results):
-    speeds = calculate_speeds(results)
-
-    total_speed = sum(speeds.values())
-
-    print("\nINITIAL SUGGESTED WORKLOAD SHARES")
-    print("-" * 40)
-
-    for pc_name, speed in speeds.items():
-        percentage = speed / total_speed * 100
-
-        print(
-            f"{pc_name}: {percentage:.2f}%"
-        )
-
-
-def calculate_sample_allocation(
-    results,
-    total_samples=500,
-):
-    speeds = calculate_speeds(results)
 
     total_speed = sum(speeds.values())
 
     raw_allocations = {
         pc_name: (
-            speeds[pc_name]
-            / total_speed
-            * total_samples
+            speed/total_speed * TOTAL_BATCHES
         )
-        for pc_name in speeds
+        for pc_name, speed in speeds.items()
     }
 
+    # First assign the integer portion.
     allocations = {
-        pc_name: int(raw_allocations[pc_name])
-        for pc_name in raw_allocations
+        pc_name: int(raw_value)
+        for pc_name, raw_value
+        in raw_allocations.items()
     }
-
-    allocated_so_far = sum(allocations.values())
 
     remaining_samples = (
-        total_samples - allocated_so_far
+        total_samples
+        - sum(allocations.values())
     )
 
+    # Allocate leftover samples to workers with
+    # the largest fractional remainders.
     decimal_order = sorted(
         raw_allocations,
         key=lambda pc_name: (
@@ -221,37 +375,73 @@ def calculate_sample_allocation(
         reverse=True,
     )
 
-    for pc_name in decimal_order[:remaining_samples]:
+    for pc_name in decimal_order[
+        :remaining_samples
+    ]:
         allocations[pc_name] += 1
 
-    print("\nSUGGESTED SAMPLE ALLOCATION")
-    print("-" * 40)
+    print("\nSUGGESTED ADAPTIVE ALLOCATION")
+    print("-" * 48)
 
-    for pc_name, sample_count in allocations.items():
+    for pc_name, batch_budget in allocations.items():
         percentage = (
-            sample_count / total_samples * 100
+            batch_budget
+            / total_samples
+            * 100
         )
 
         print(
             f"{pc_name}: "
-            f"{sample_count} images "
+            f"{batch_budget} batches "
             f"({percentage:.2f}%)"
         )
 
     print(
-        f"Total: {sum(allocations.values())} images"
+        f"Total: "
+        f"{sum(allocations.values())} batches"
     )
 
     return allocations
 
 
 def main():
+    if sum(INITIAL_ALLOCATION.values()) != (
+        TOTAL_STAGE1_SAMPLES
+    ):
+        raise ValueError(
+            "INITIAL_ALLOCATION must add up to "
+            f"{TOTAL_STAGE1_SAMPLES} samples."
+        )
+
     results = {}
 
+    print("=" * 60)
+    print("STAGE 1: EQUAL WORKLOAD PROFILING")
+    print("=" * 60)
+
+    print("\nInitial allocation:")
+
+    for pc_name, batch_budget in (
+        INITIAL_ALLOCATION.items()
+    ):
+        print(
+            f"{pc_name}: {batch_budget} batches"
+        )
+
+    print(
+        f"Total: "
+        f"{sum(INITIAL_ALLOCATION.values())} batches"
+    )
+
     for pc_name, host in WORKERS.items():
-        metrics = run_worker(
+        batch_budget = INITIAL_ALLOCATION[
+            pc_name
+        ]
+
+        metrics = profile_worker(
             pc_name,
             host,
+            batch_budget,
         )
 
         if metrics is not None:
@@ -272,14 +462,17 @@ def main():
             f"{len(WORKERS)} workers."
         )
 
+        print(
+            "Adaptive allocation will use only "
+            "the successful workers."
+        )
+
     if len(results) >= 2:
         detect_stragglers(results)
 
-        print_suggested_allocation(results)
-
-        calculate_sample_allocation(
+        calculate_batch_allocation()(
             results,
-            total_samples=SUBSET_SIZE,
+            total_samples=TOTAL_STAGE1_SAMPLES,
         )
 
 
