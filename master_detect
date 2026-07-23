@@ -40,7 +40,7 @@ def build_training_command(
     return (
         f"{PYTHON_PATH} {TRAIN_SCRIPT} "
         f"--worker-id {pc_name} "
-        f"--subset-size 12500 "
+        f"--subset-size {LOCAL_DATASET_SIZE} "
         f"--max-batches {max_batches} "
         f"--epochs {EPOCHS} "
         f"--batch-size {BATCH_SIZE} "
