@@ -14,7 +14,7 @@ workers = {
 }
 
 project_dir = "/tmp/kgzh0394/gpu_straggler_project"
-python_path = "/tmp/kgzh0394/pytorch-cu128/bin/python"
+python_path = "/tmp/kgzh0394/ddnn-env/bin/python"
 
 TOTAL_IMAGES = 2000
 
